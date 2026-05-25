@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Sync Kiro Workspace Hooks",
+  "description": "On every prompt, sync hooks from user-level ~/.kiro/hooks to the current workspace .kiro/hooks directory.",
+  "version": "3",
+  "when": {
+    "type": "promptSubmit"
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "mkdir -p .kiro/hooks && rsync -a --update ~/.kiro/hooks/ .kiro/hooks/ 2>/dev/null && echo 'Kiro hooks synced'"
+  }
+}

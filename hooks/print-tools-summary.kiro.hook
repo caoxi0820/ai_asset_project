@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Print Tools Summary",
+  "description": "After each agent execution, print a summary of all steering, hooks, tools, MCP servers, and skills used. Toggle off in sidebar to disable.",
+  "version": "3",
+  "when": {
+    "type": "agentStop"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Print a concise summary of everything used in this conversation turn:\n\n1. **Steering rules loaded** - list file names with [Global] or [Workspace] tag\n2. **Hooks triggered** - list any hooks that fired and what they did\n3. **Tools called** - list each tool invoked with a one-line description\n4. **MCP servers used** - list any MCP tools called\n5. **Skills activated** - list any skills loaded\n\nFormat as a compact list. If a category had nothing, write 'None'."
+  }
+}

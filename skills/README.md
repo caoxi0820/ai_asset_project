@@ -14,25 +14,6 @@ skills/<skill-name>/
 └── assets/               # Templates, boilerplate (optional)
 ```
 
-## SKILL.md Format
-
-```markdown
----
-name: skill-name
-description: What + when to use
-version: 1.0.0
-tags: [keywords]
----
-
-# Skill Name
-
-## Overview
-## Usage
-## Core Concepts
-## Quick Reference
-## Common Mistakes
-```
-
 ## Installation
 
 Copy the entire skill directory to `~/.kiro/skills/`.
@@ -41,4 +22,5 @@ Copy the entire skill directory to `~/.kiro/skills/`.
 
 | Skill | Description |
 |-------|-------------|
-| *(add entries as you add skills)* | |
+| `code-insight/` | 分析当前工作区并生成结构化项目报告（含 Mermaid 图）。自动检测项目类型（代码/文档/混合），适配不同分析路径。输出中文报告保存为 `CODE_INSIGHT.md`。 |
+| `leda-triage/` | 对 Jira issue 运行 Leda triage 分析，结合用户提供的修复方案，生成结构化知识文件并保存到 EFD-China-Knowledge 仓库。用于沉淀问题排查经验。 |

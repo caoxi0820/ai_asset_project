@@ -4,47 +4,15 @@ Event-driven automations triggered by IDE events.
 
 ## Format
 
-Each hook is a `.json` file:
-
-```json
-{
-  "name": "Hook Name",
-  "version": "1.0.0",
-  "description": "What this hook does",
-  "when": {
-    "type": "fileEdited|fileCreated|fileDeleted|userTriggered|promptSubmit|agentStop|preToolUse|postToolUse|preTaskExecution|postTaskExecution",
-    "patterns": ["*.ts"],
-    "toolTypes": ["write"]
-  },
-  "then": {
-    "type": "askAgent|runCommand",
-    "prompt": "for askAgent",
-    "command": "for runCommand"
-  }
-}
-```
-
-## Event Types
-
-| Event | Trigger |
-|-------|---------|
-| `fileEdited` | User saves a file |
-| `fileCreated` | New file created |
-| `fileDeleted` | File deleted |
-| `userTriggered` | Manual button click |
-| `promptSubmit` | Message sent to agent |
-| `agentStop` | Agent execution completes |
-| `preToolUse` | Before tool execution |
-| `postToolUse` | After tool execution |
-| `preTaskExecution` | Before spec task starts |
-| `postTaskExecution` | After spec task completes |
+Each hook is a `.kiro.hook` (or `.json`) file defining a trigger event and an action.
 
 ## Installation
 
-Copy `.json` files to `~/.kiro/hooks/` (user-level) or `.kiro/hooks/` (workspace-level).
+Copy hook files to `~/.kiro/hooks/` (user-level) or `.kiro/hooks/` (workspace-level).
 
 ## Hooks in this collection
 
-| File | Description |
-|------|-------------|
-| *(add entries as you add hooks)* | |
+| Hook | Event | Description |
+|------|-------|-------------|
+| `print-tools-summary.kiro.hook` | `agentStop` | Agent 执行结束后，自动打印本轮使用的 steering、hooks、tools、MCP servers、skills 的摘要。方便调试和了解 agent 行为。 |
+| `sync-kiro-workspace.kiro.hook` | `promptSubmit` | 每次发送消息时，自动将 `~/.kiro/hooks/` 同步到当前工作区的 `.kiro/hooks/`，确保 IDE 侧边栏能看到所有 hooks。 |

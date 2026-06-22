@@ -82,10 +82,13 @@ Where `<component>` is the component field value from Front Matter (e.g. graphic
 
 Example: `/Users/caoxicz/workspace-mac/leda/source/EFD-China-Knowledge/graphics/DRM-Modeset-Module-CRC-Mismatch.md`
 
+## Constraints
+
+- **ALL output MUST be written in English.** This includes the generated knowledge file, runbooks, summaries, and any descriptive content produced by this skill. This rule applies regardless of the language used in the user's prompt or the source Jira ticket. Technical terms, logs, and code remain as-is.
+
 ## Guidelines
 
 - Symptoms section MUST include searchable key log snippets (wrapped in code blocks)
 - Root Cause section should distinguish "direct cause" from "underlying cause"
 - LLM Diagnostic Guide MUST contain specific log search patterns, not vague descriptions
 - If triage found no root cause (Root Cause Found: No), still generate the knowledge file but mark root cause as "TBD"
-- Write descriptive content in English; keep technical terms, logs, and code as-is

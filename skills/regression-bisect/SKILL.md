@@ -1248,11 +1248,268 @@ Agent 生成 JSON 文件并保存到 `history/` 目录。
 
 ---
 
+---
+
+## Step 14 (v0.3.1): JIRA Comment 信号提取
+
+### 14.1 目的
+
+BOC-2461 经验表明，JIRA 评论中工程师的实际讨论包含了最高质量的信号——已排除的方向、具体 CR 链接、binary diff 观察、kill-test 结论等。当前流程仅读取 LEDA 输出，遗漏了这些关键信息。
+
+### 14.2 触发条件
+
+在 Step 1（LEDA 信号提取）后自动执行：
+- 如果 `issue_triage.json` 中 `comments_count > 5`，尝试通过 dsai-mcp `jira_get_issue` 获取 JIRA 评论
+
+### 14.3 提取规则
+
+从 JIRA 评论中提取：
+
+| 信号类型 | 匹配模式 | 用途 |
+|----------|----------|------|
+| **已排除的方向** | "not the root cause", "rejected", "ruled out", "不是原因" | 在打分中给 -15 避免误判 |
+| **具体 CR/Gerrit 链接** | `CR-\d+`, `gerrit6.labcollab.net/c/.+/\+/\d+` | 直接加入嫌疑列表 |
+| **Binary diff 观察** | `.so`, `+XXX KB`, "native-lib diff", "entry_point" | 标记 binary asset 变更 |
+| **Kill test 结论** | "systemctl stop", "100% attribution", "kill test" | 直接确认归因 |
+| **具体代码路径** | 文件路径 + 行号引用, "aplview.cpp:384" | 加入 file_paths 信号 |
+
+### 14.4 输出
+
+在 Step 1 信号输出后增加一节：
+
+```
+══ JIRA Comment 信号（工程师讨论） ══
+已排除方向:  [CR-281429686 (APL path) — Brioche 不走 APL，走 Rive/RN]
+关键 CR:     [CR-283186451 (Volta→Stable-IView switch)]
+Binary 变更: [entry_point_factory.so +33KB, libclock-face-home-launcher.so]
+Kill test:   [systemctl stop stemd → 100% attribution to homelauncher]
+```
+
+---
+
+## Step 15 (v0.3.1): Binary Asset / Native Lib 变更追踪
+
+### 15.1 目的
+
+VS diff 中的 source change 可能只包含配置文件变更（如 recipe 中的版本号），但实际打包了大量 prebuilt native binary（.so、.bundle）变更。纯 commit message 分析无法发现这类隐式改动。BOC-2461 的真正 culprit（ClockFaceHome Rive renderer）就藏在 `VegaPuffinAdapters-brioche` 的 binary assets 中。
+
+### 15.2 识别规则
+
+对 HIGH tier 包，检查以下信号标记为 "可能包含 binary asset 变更"：
+
+```
+1. Version jump 很大（> 500 个版本跨度）但 commit 数 < 5
+   → 可能是 binary prebuilt 自动 bump，代码变更在上游 source package
+   
+2. Package 名含 "Adapters", "App", "Prebuilts", "Bindle", "Assets"
+   → 通常是打包层，包含 .so/.bundle 文件而非源码
+
+3. JIRA Comment 或 LEDA 分析中提到的 binary 文件名
+   (如 entry_point_factory.so, lib*.so, *.bundle)
+   → 追踪这些 binary 属于哪个 VS diff 中的包
+```
+
+### 15.3 处理流程
+
+当识别到 binary asset 包时：
+
+```
+1. 获取该包的 version diff commit list
+2. 如果 commit message 中出现 "bump", "update prebuilt", "sync binary"：
+   → 标记为 "binary asset bump，需追踪上游 source"
+   → 尝试从 commit message 中提取上游 package / branch / SRCREV 信息
+3. 如果无法追踪上游：
+   → 在输出中明确标注 "binary 变更来源不明，需人工确认"
+   → 提供 version diff URL 让用户手动检查
+```
+
+### 15.4 输出格式
+
+```
+⚠️ Binary Asset 变更检测:
+
+  Package: VegaPuffinAdapters-brioche (25058 → 26841, Δ1783 versions)
+  疑似 binary:  entry_point_factory.so (+33KB), libherareact.so (+2.6KB)
+  来源追踪:     未找到上游 source commit — 需人工确认
+  风险:         🔴 高 — 大量 binary 变更可能引入行为变化
+  Version diff: https://code.amazon.com/packages/VegaPuffinAdapters-brioche/brazil-version-diff?...
+```
+
+---
+
+## Step 16 (v0.3.1): 渲染路径迁移 Pattern 识别
+
+### 16.1 目的
+
+BOC-2461 暴露了一种特殊的 regression pattern：**渲染路径迁移导致隐式行为丢失**。新代码本身没有 bug，但新路径缺少旧路径隐式提供的优化（damage tracking, frame coalescing, idle quiescent）。
+
+### 16.2 识别信号
+
+当 commit message / 包名 / LEDA 信号中出现以下关键词时，激活此 pattern 分析：
+
+```
+- "migration", "migrate", "switch to", "enable USE_STABLE"
+- "Volta → Stable", "legacy → new", "path switch"  
+- "refactor", "replace backend", "new rendering path"
+- 包名含 "Stable", "IView", "Migration"
+```
+
+### 16.3 分析要点
+
+当检测到渲染路径迁移时，agent 必须回答：
+
+```
+Q1: 新路径上是否保留了旧路径上的以下隐式优化？
+    - Compositor damage tracking (content 不变时跳过 GPU)
+    - Frame coalescing (多个 invalidate 合并为一次 render)
+    - Idle quiescent (无活动时 render loop 休眠)
+
+Q2: 新路径的 "always render" vs "render on demand" 模型是否与旧路径一致？
+    - 旧路径: render on demand (只在 dirty 时 render)
+    - 新路径: always render (每帧都 render，靠 compositor 去重)
+    → 如果 compositor 去重失效，就会导致 GPU 满负荷
+
+Q3: requestFrame() 的调用条件是否变了？
+    - 旧路径: 可能由 volta 框架自动管理 idle
+    - 新路径: 需要消费者自行管理 quiescent
+    → 如果消费者未适配新路径的 quiescent 协议，就会持续请求帧
+```
+
+### 16.4 输出
+
+```
+🔄 渲染路径迁移 Pattern 检测:
+
+  迁移类型: Volta → Stable-IView
+  涉及包:   APLViewhostVega (基础设施), VegaPuffinAdapters-brioche (消费者)
+  
+  ⚠️ 关键问题: 新路径上消费者是否适配了 quiescent 协议？
+  旧路径行为: volta compositor 隐式 damage tracking → idle 时 GPU 不工作
+  新路径行为: 消费者需自行 gate requestFrame() on dirty → 未 gate 则 GPU 满负荷
+  
+  验证方法: 对比 good/bad build 上 panfrost-job IRQ 频率
+            → 相同 frame loop 频率但 GPU 工作量不同 = compositor 层优化丢失
+```
+
+---
+
+## Step 17 (v0.3.1): "基础设施 vs 消费者" 归因区分
+
+### 17.1 目的
+
+避免误判：当 regression 涉及 "framework provides render loop + consumer decides what to render" 的分层架构时，需要区分 bug 在哪一层。BOC-2461 中 `aplview.cpp` 提供了 frame loop 但自身无 bug，bug 在消费者 (ClockFaceHome)。
+
+### 17.2 判断规则
+
+```
+如果一个改动满足以下全部条件：
+  1. 改动是 "基础设施" 类型（提供 render loop / event dispatch / IPC channel）
+  2. 改动在 good build 和 bad build 上的执行路径相同（代码没变，只是被调用了）
+  3. regression 的差异在于 "每帧执行的工作量" 而非 "是否执行"
+
+→ 则 bug 不在基础设施层，在消费者层
+→ 基础设施层的改动应标注为 "enabler (非 root cause)" 而非 "culprit"
+→ 需追踪消费者层的变更
+```
+
+### 17.3 输出中的区分
+
+```
+嫌疑分类:
+  🏗️ Enabler (基础设施变更，使问题暴露): 
+     APLViewhostVega aplview.cpp — 提供 frame loop，本身无 bug
+  
+  🐛 Culprit (实际产生问题的变更):
+     ClockFaceHome Rive renderer — 每帧无条件提交 GPU 工作
+```
+
+---
+
+## Step 18 (v0.3.1): Context 容量管理策略
+
+### 18.1 目的
+
+345 个 source change packages 在 Step 5 中逐包获取 commit detail 时经常导致 context 爆满。需要更激进的优先级排序以确保每次都能跑完全流程。
+
+### 18.2 优化规则
+
+```
+1. Step 5 前增加 "TOP 5 深入" 子步骤:
+   - 基于 Step 3 的 tier + JIRA comment 信号 + 语义判断
+   - 选出最值得深入的 5 个包（不是 15 个）
+   - 对这 5 个获取完整 version diff
+
+2. 对每个包的 version diff:
+   - 如果 commit 数 > 20：只看 commit message list，不获取代码 diff
+   - 只对 message 打分 Top 3 的 commit 获取代码级 diff
+   - 避免获取 doc-only / test-only commit 的 diff
+
+3. 提前中止规则:
+   - 如果 JIRA comment 已给出明确 kill-test 结论 + CR 链接
+   - 则跳过 Step 5-7 的批量获取，直接进入 Step 8 对已知 CR 做因果链分析
+
+4. 大包警告:
+   - 如果某个包的 version diff 返回结果 > 50 个 commit
+   - 先只输出 commit 列表摘要，问用户是否需要深入
+   - 或者直接用 commit message 打分选 Top 5 深入
+```
+
+---
+
+## Step 19 (v0.3.1): Removed/Replaced Packages 分析
+
+### 19.1 目的
+
+VS diff 中 "Removed" 的包如果同时有同名/类似名的 "Added" 或 source change 包出现，说明发生了**框架版本大跳跃**（如 VegaUIReact 3.x → 4.x）。这种替换升级容易引入隐式行为变化。
+
+### 19.2 识别规则
+
+```
+扫描 VS diff 的 removed + added/source-change 列表:
+  如果 pkg_removed 的包名与 pkg_new 有共同前缀（去掉版本后缀后相同）:
+    → 标记为 "版本替换升级"
+    → 提升到 MEDIUM tier（如果原来是 LOW）
+    
+  例: VegaUIReact (3.x, removed) + VegaUIReact (4.x, source change)
+    → "React Native 框架大版本升级 3.x→4.x"
+    → 渲染行为可能有重大变化
+```
+
+### 19.3 输出
+
+```
+🔄 版本替换升级检测:
+
+  Removed: VegaUIReact 3.x-mainline (7 个相关 3.x 包全部 removed)
+  Added:   VegaUIReact 4.x-mainline (source change)
+  
+  ⚠️ 风险: React Native 大版本升级，render/animation/gesture 行为可能变化
+  建议: 查看 4.x release notes 中是否有 render loop / frame scheduling 相关变更
+```
+
+---
+
+## 已知 Regression Patterns（经验总结）
+
+基于 BOC-2420, BOC-2377, BOC-2461 的经验，以下 pattern 应在分析时优先检查：
+
+| # | Pattern | 典型信号 | 教训 |
+|---|---------|----------|------|
+| 1 | **SRCREV bump + branch 升级** | recipe 中一行 hash 变更 | 一行变化 = 几十个未验证 commit (BOC-2420) |
+| 2 | **渲染路径迁移** | "Volta→Stable", "USE_STABLE_VIEW" | 新路径可能丢失旧路径的隐式 GPU 优化 (BOC-2461) |
+| 3 | **Binary asset 隐式变更** | Adapters/App 包大 version jump | source diff 里看不到真正的 binary 改动 (BOC-2461) |
+| 4 | **基础设施 vs 消费者** | framework + consumer 分层 | framework 无 bug，bug 在 consumer 对新 API 的使用 (BOC-2461) |
+| 5 | **Good/Bad 跑相同代码** | frame loop 频率相同 | 区别在每帧执行的工作量，不在调用频率 (BOC-2461) |
+| 6 | **级联因果链** | OOM → slab → driver → middleware | 需从表象追问 4-5 层 "谁触发了谁" (BOC-2420) |
+
+---
+
 ## 版本演进说明
 
 | 版本 | 新增能力 | 本文件状态 |
 |------|----------|-----------|
 | **v0.1** | 解析 LEDA + subsystem_map 粗筛 + 分 tier 输出 | ✅ 已完成 |
 | **v0.2** | commit detail 获取 + 逐 commit 打分 + 排序输出 | ✅ 已完成 |
-| **v0.3** | 候选改动枚举 + 因果链 + 验证指引 + LLM 语义匹配 + 依赖图 + 积累学习 | ✅ 当前版本 |
+| **v0.3** | 候选改动枚举 + 因果链 + 验证指引 + LLM 语义匹配 + 依赖图 + 积累学习 | ✅ 已完成 |
+| **v0.3.1** | JIRA comment 信号 + binary asset 追踪 + 渲染迁移 pattern + 基础设施/消费者归因 + context 管理 + 版本替换检测 | ✅ 当前版本 |
 | v0.4 | 自动触发 build 验证 + KBITS 集成 + 更多平台支持 | 待规划 |

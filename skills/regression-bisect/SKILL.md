@@ -3,7 +3,7 @@
 ## Metadata
 
 - **Name:** eml-regression-bisector
-- **Version:** 0.3
+- **Version:** 0.3.5
 - **实现形式:** 纯 agent 指令（无 Python 脚本），agent 读完本文件后直接用工具执行
 
 ---
@@ -18,6 +18,146 @@
 3. 询问用户是否继续
 
 除此之外的任何其他原因（包括历史文件存在、已知 root cause 等）都**不构成暂停理由**——历史知识只作为加分因子融入打分，流程仍然完整执行。
+
+---
+
+## 🔴 五条最高优先级铁律（凌驾于全流程之上）
+
+这五条规则的优先级高于本文件里任何 subsystem_map、keyword 打分、crash 栈推断。当它们与后续任何 Step 的启发式判断冲突时，**以这五条为准**。
+
+### 铁律 1：LEDA triage 的结论是权威，不是"信号之一"
+
+用户在 bisect 之前**已经跑过 LEDA triage**，LEDA 已经做完了因果分析并给出了明确结论。本 skill 的价值是在 LEDA 结论**之上**做 VS diff / commit 级别的落地定位，**不是**重新推翻 LEDA 另起炉灶。
+
+**MUST（必须）：**
+1. **在做任何 subsystem 粗筛 / keyword 打分之前**，先完整读取并采纳 LEDA 的结论。来源二选一（按优先级）：
+   - **首选**：`~/workspace/leda/LedaTriage/output_<JIRA_ID>/` 目录下的 report / summary（尤其 `summaries/<JIRA_ID>_*.md`、`crash_report.md`、任何 `*_analysis.md`）；
+   - **次选**：JIRA 上的 LEDA triage comment（用 `dsai-mcp jira_get_issue` 拉 `BOC-<n>` 的 comments，找 LEDA/triage bot 发的那条）。
+2. 从 LEDA 结论里**逐字提取**以下"权威判定"，并在报告里原样引用：
+   - **Regression localization / root-cause CR**（LEDA 常直接给出 `CR-xxxxxxx` + confidence，如 "localized (STRONG) to CR-303318583"）；
+   - **Suspect package / owner**（如 VegaHLOOBELib）；
+   - **Crash 归因链**（哪个进程、哪个线程、哪个 module）；
+   - **已被 LEDA 排除的方向**（如 "Weston/platform-graphics and Connectivity are ruled out"）；
+   - **对应的 forward fix CR**（如 CR-305486772 / MMSETUP-31253）。
+3. **LEDA 给出的 root-cause CR / package 直接成为嫌疑 #1（可信度：高）**，不需要再用 subsystem_map 去"验证"它配不配。后续 Step 只做一件事：**在 LEDA 指认的 package 里把结论落地到具体 commit**（见铁律 2）。
+
+**MUST NOT（禁止）：**
+- ❌ 禁止在没有引用 LEDA 结论的情况下直接输出自己的 root-cause 判断。
+- ❌ 禁止因为 subsystem_map 把某个包打成 HIGH tier，就在 LEDA 已明确点名 package 时用它**取代** LEDA 指认的包。subsystem 打分是**补充**候选、不是替换 LEDA 的点名。
+
+**🔴 红线（BOC-2517 第三次复盘教训，凌驾于本铁律其余条款）：LEDA 的"排除 / enabler"标注只调整可信度，绝不缩小深度分析集。**
+
+这条红线存在的原因是一个真实且代价高昂的教训（BOC-2517 ground truth）：真 culprit 是 **CR-301739468 / VegaMetaAmazonGraphics**（Force-disable AFBC on panfrost for Brioche，mesa 26.1），命中 crash 栈最内层 `panfrost_ptr_unmap` abort 帧、且在 good→bad diff 窗口内是 source-change 行。但 agent 因为 LEDA 把 Mesa/Panfrost 判为 "symptom landing point / enabler, not root cause"、又把**另一个** graphics 包 `VegaMetaVegaRecipesGraphics` 判成 false positive，就对**整个 graphics 子系统降权**，从未深挖 `VegaMetaAmazonGraphics`。事后证明 **LEDA 的 innermost-frame（Mesa/Panfrost）归因本来是对的，是 LEDA 自己的 infra-vs-consumer 推理把这个正确方向 reconcile 到了错误的 consumer 方向**。
+
+**MUST：**
+1. **crash 栈命中的包（尤其最内层 abort 帧所在的子系统），永远强制进 HIGH tier 且强制并入深度分析集**（与铁律 5 一致），**即使 LEDA 把该子系统标为 enabler / ruled-out**。LEDA 的"排除"只允许把该包的**可信度标注**下调（如标 `[LEDA 判为 enabler]`），**绝不允许把它移出深度分析集或跳过对它的 commit-level 深读**。
+2. **"排除某子系统" ≠ "排除该子系统里的每一个包"。** LEDA 排除 `VegaMetaVegaRecipesGraphics` 不等于排除 `VegaMetaAmazonGraphics` / `KeplerGraphicsTurbo` 等同子系统的**其他**包——每个包必须独立按铁律 4 全量分 tier、独立判定，不得因同子系统的兄弟包被排除而连坐降权。
+3. **crash 栈最内层帧所在的基础设施库（Mesa/Panfrost/Skia 等）是 root cause 的可能性必须保留。** §Step 17（基础设施 vs 消费者）是一个**待验证的假设方向，不是默认结论**：可以推断 culprit 在 consumer，但**必须同时深挖最内层基础设施包在窗口内的真实 source change**；只有确认该基础设施包窗口内零 source change（tree hash 相同）后，才可下调其可信度。禁止仅凭"它是底层库"就不深挖。
+
+**MUST NOT：**
+- ❌ 禁止用 "LEDA 说这是 enabler/ruled-out" 作为**不深挖**某个命中 crash 栈或在 diff 窗口内的包的理由。排除只降可信度标注，不减深度分析集。
+- ❌ 禁止因为同子系统的**另一个**包被判为 false positive，就对整个子系统降权、连带跳过真正在窗口内的兄弟包。
+
+**LEDA 结论缺失时的兜底**：只有当 output 目录和 JIRA comment 里都**确实找不到** LEDA 的明确 localization / CR 时，才回退到本 skill 的 subsystem_map + keyword + VS diff 打分流程（Step 3 以后），并在报告里**明确标注**"LEDA 未给出明确 root-cause，以下为 bisector 自主推断"。
+
+### 铁律 2：必须落地到具体 commit id
+
+只告诉用户"是某个 package / 某个 CR 导致的"是**不合格**的。用户要的是**可以直接 revert 的 commit id**。
+
+**MUST：**
+1. 定位到嫌疑 package 后（无论来自 LEDA 还是自主打分），**必须**用本文件 §9.6 的约定把该 package checkout 到 `~/workspace/vml/repo1/repo1/src/<PACKAGE>`（已存在则直接用），然后在 git 历史里找到对应 commit。
+2. 报告里对每个嫌疑 CR **必须**给出：
+   - **Commit SHA**（完整或短 SHA，如 `ddd7842`）；
+   - **确认它在 mainline HEAD 里**（`git merge-base --is-ancestor <sha> HEAD`）——排除同名但不在 HEAD 的重复 commit；
+   - **commit message 里的 `cr: CR-xxxxxxx`**，与 LEDA 指认的 CR 交叉核对一致；
+   - **可直接执行的 revert 命令**：
+     ```bash
+     cd ~/workspace/vml/repo1/repo1/src/<PACKAGE>
+     git revert <sha>
+     ```
+3. 若 LEDA 给的是 CR 号，用 `git -P log --oneline --all | grep -iE "<CR 号或 subject 关键词>"` 反查出 SHA，并**读 diff 确认**该 commit 的代码变更确实对应 LEDA 描述的机制（如"双重 present connected 屏"）。
+4. 若存在 forward fix CR，检查它是否已 merge 到 mainline（`grep` 搜不到即未 merge）；未 merge 时明确告诉用户"直接 revert culprit commit 是最干净的止血办法"。
+
+**MUST NOT：**
+- ❌ 禁止只停在 package 名或 CR 号就结束，不给 commit SHA。
+- ❌ 禁止在没 checkout、没读 git 历史的情况下"猜"一个 commit id。
+
+### 铁律 3：LEDA 结论与 build diff 必须双管齐下，缺一不可
+
+LEDA triage 和两个 build 之间的 VS diff 是**两个独立的证据源**，本 skill 必须**同时**参照二者、交叉验证，最后按嫌疑度输出排序。**只依赖 LEDA（跳过 diff）或只依赖 diff（无视 LEDA）都是不合格的。** 这条铁律存在的原因是一个真实教训（BOC-2517）：agent 采信了 LEDA 点名的 CR + 本地 `git merge-base --is-ancestor <sha> HEAD` 通过，就断定它是 culprit——但 `HEAD` 是**当前 mainline 状态**，不等于该 commit 在这**两个 build 之间**被引入到镜像。拉了 VS diff 后才发现该 package 根本不在 good→bad 窗口里，结论必须推翻。
+
+**MUST（必须）：**
+1. **无论 LEDA 是否已点名 culprit，都必须执行 Step 2 拉取 good→bad 的完整 VS diff**（KBITS 401 时用 §Step 2 的 code.amazon.com revision 对比绕过）。历史结论、上次同一 ticket 已验证过、LEDA 高置信——**都不构成跳过 diff 的理由**。
+2. **把 LEDA 点名的 CR/package 与 VS diff 交叉核对**，必须回答：
+   - LEDA 点名的 package **是否出现在** good→bad 的 source-change 列表里？
+   - 若该 package 不作为独立行出现（例如 lib 被打进某个 vpkg / meta / adapters 包），**必须追出它经由哪个 source-change 包打进 bad build**，并在那个包的窗口 commit 里确认 culprit commit 真实存在。
+   - **`在 mainline HEAD 里` 不能替代 `在 good→bad 窗口里`**——前者只证明 commit 存在于当前分支，后者才证明它是这次 regression 引入的。两个判定都要做。
+3. **最终按嫌疑度排序输出所有可疑改动**，每个嫌疑标注其证据来源：`[LEDA 点名]` / `[在 diff 窗口内]` / `[两者皆有]`。可信度排序原则：
+   - **高**：LEDA 点名 **且** 在 diff 窗口内证实引入（两个独立证据源都指向它）；
+   - **中**：只有一个证据源支持（LEDA 点名但 diff 未证实在窗口内，或在 diff 窗口内且命中 crash 路径但 LEDA 未点名）；
+   - **低**：机制上吻合但两个证据源都不能直接支撑。
+4. 若 LEDA 点名的 commit **在 diff 窗口里找不到**，必须**如实下调其可信度并说明矛盾**，同时把 diff 窗口里命中 crash 路径的改动作为新的候选提上来——不得为了迎合 LEDA 结论而隐瞒 diff 证据的缺失。
+
+**MUST NOT：**
+- ❌ 禁止因为"上次这个 ticket 已经验证过"或"LEDA 置信度高"就跳过 Step 2 的 VS diff。
+- ❌ 禁止只凭 `git merge-base --is-ancestor <sha> HEAD` 通过就断言某 commit 是本窗口的 culprit。
+- ❌ 禁止只输出单一 root cause 而不给出按嫌疑度排序的完整候选列表（用户明确要求"按嫌疑度告诉我都有哪些可疑的改动"）。
+
+### 铁律 4：先全量分 tier，再取关联度 Top 5 深度分析（防漏 + 防 context 爆）
+
+这条铁律存在的原因是一个真实教训（BOC-2517 第二次复盘）：agent 采信了 LEDA 点名的 package，就只追那一两个包，**从未把 good→bad 的全部 source-change 包做系统打分**，结果把明显在 crash 渲染链上的 `VegaUIReact-Rive*` / `VegaUIReact-FastImage*` / `VegaUIComponentKit` / `KeplerGraphicsTurbo` 等窗口内包**根本没纳入视野**——不是评估后排除，是压根没打分。**"采纳 LEDA 结论"(铁律 1) 只能让某个包的嫌疑度上浮，绝不允许因此缩小候选集、跳过对其余包的打分。**
+
+分两步，缺一不可：
+
+**第一步——全量分 tier（强制，防漏）：**
+1. **MUST**：Step 2 拿到 VS diff 后，**必须对每一个 source-change 包**逐一判定 tier（HIGH/MED/LOW/RULEDOUT/EXCLUDED），**不允许"眼睛扫"只挑 LEDA 相关的名字**。
+2. **MUST**：分 tier 用**可复现的规则脚本**跑（keyword + subsystem_map + crash-path 反查，见铁律 5），把结果落盘，而不是在脑子里筛。
+3. **MUST**：输出计数并校验等式 `HIGH + MED + LOW + RULEDOUT + EXCLUDED == source-change 总数`。等式对不上 = 没做完，禁止进入报告。
+4. **MUST NOT**：禁止在未完成全量分 tier 前就开始追 LEDA 点名的包。
+
+**第二步——取关联度 Top 5 深度分析（限量，防 context 爆）：**
+1. **MUST**：从全量打分结果里，按关联度（tier + keyword 分 + crash-path 命中 + LEDA 加权 + 历史先验）**排序取 Top 5** 个最相关的 package，对这 5 个做 commit 级深度 diff 分析（Step 5–9）。
+2. **MUST**：如果 LEDA 点名的 package 不在 Top 5 自然排名内，**强制把它并入**（LEDA 点名 = 关联度加权，保证它一定被深挖），此时深度分析集 = Top 5 ∪ {LEDA 点名包}。
+3. **MUST**：如果 crash 栈组件反查（铁律 5）命中的包不在 Top 5 内，**也强制并入**——栈命中的包一定要深挖。
+4. 深度分析集通常 ≤ 7 个（Top 5 + LEDA 点名 + 栈命中去重后）。若确实超过 context 预算，按关联度截断，并在报告里列出"因预算未深挖"的包名，不许静默丢弃。
+
+**MUST NOT：**
+- ❌ 禁止只深挖 LEDA 点名的 1–2 个包就收敛写报告。
+- ❌ 禁止让"深度分析限 5 个"变成"分 tier 也只看 5 个"——分 tier 必须全量，限量只作用于深度分析这一步。
+
+### 铁律 5：crash 栈里的每一个组件，都必须在 diff 窗口里显式反查并标注命中/未命中
+
+这条铁律存在的原因同样是 BOC-2517 教训：crash_report 的栈里明明写着 `RiveSetupPresenter → Skia GrGLGpu::uploadTexData → Mesa/Panfrost`，agent 却没有回头去 diff 窗口里找 `Rive` / `Skia` / `FastImage` / 纹理上传相关的包——**"读栈"和"在 diff 里搜索栈组件"两个动作脱节了**。本铁律把它们强制绑定。
+
+**MUST：**
+1. 从 crash_report / LEDA 栈里**提取所有 frame 组件名**：库名（如 `libgallium`、`libuifoundation`、`libHLOOBE`）、renderer / 引擎名（如 `Rive`、`Skia`、`Volta`、`Panfrost`、`Mesa`）、类名（如 `RiveSetupPresenter`、`GrGLGpu`、`RenderPipelinePriv`）。
+2. 对**每一个**栈组件，用 **crash-path 反查表**（见下）映射到 package pattern，在全部 source-change 包里做名字匹配。
+3. **命中的包强制进 HIGH tier 且强制并入深度分析集**（铁律 4 第二步）。
+4. **未命中的组件也 MUST 在报告里写一行**：`栈组件 X → 窗口内无对应 source change（可能经 version-only 引入 / 或非本窗口）`。不许对未命中保持沉默——未命中本身是证据。
+
+**crash-path 反查表（栈组件 → package pattern，随经验增补）：**
+
+| 栈组件 / 关键词 | 映射 package pattern |
+|---|---|
+| Rive / RiveSetupPresenter | `VegaUIReact-Rive`, `VegaUIReact-Rive-Src`, `*Rive*` |
+| Skia / ZealSkia / GrGLGpu / SkCanvas | `VegaUIFramework`, `VegaUIComponentKit`, `*Skia*`, `*FastImage*`（纹理上传路径） |
+| Volta / libuifoundation / RenderPipelinePriv / RenderThread | `VegaUIFramework`, `VegaUIComponentKit` |
+| Mesa / libgallium / Panfrost / panfrost_ptr_unmap | `VegaMetaVegaRecipesGraphics`, `VegaMetaAmazonGraphics`, `KeplerGraphicsTurbo`, `*Mesa*`, `*Graphics*` |
+| 纹理 / texture / glyph / Alpha_8 / ImageCache / uploadTexData | `VegaUIReact-FastImage*`, `VegaUIFramework`（ImageCache/ImageUtils）, `VegaUIComponentKit` |
+| HLOOBE / OOBE / libHLOOBE / 双 present | `VegaHLOOBELib`, `VegaPuffinApp-<device>`, `VegaPuffinAdapters-<device>`, `VegaMetaPuffinRecipePuffin` |
+| 输入 → 渲染 / input / KPENTER | `VegaInputd`, `VegaMetaVegaRecipesInput`, `KeplerInputClientInterface` |
+
+**MUST NOT：**
+- ❌ 禁止读完 crash 栈后不做栈组件 → diff 的逐一反查就进入打分。
+- ❌ 禁止因为某栈组件"是底层基础设施库"（如 Mesa）就不在 diff 里查它——查了确认无 source change（如 tree hash 相同）是合格结论，不查是不合格。
+
+### 报告覆盖率自检（配合铁律 4/5，报告末尾 MUST 打印）
+
+报告结尾 **MUST** 附一个覆盖率自检小节，任一项缺失 = 报告标注"不完整"，禁止给"完成"结论：
+- source-change 总数 = N；已全量分 tier：是/否；分 tier 计数等式是否成立。
+- 深度分析集（Top 5 ∪ LEDA 点名 ∪ 栈命中）逐包列出，标注每个"已 commit-level 深读 / 未深读（原因）"。
+- crash 栈组件清单，逐个标注"已在 diff 反查：命中 <pkg> / 未命中"。
+- 因 context 预算未深挖的包名（如有）。
 
 ---
 
@@ -40,7 +180,7 @@
 
 **默认值：**
 - Version Set: `VegaEchoInt-release/development`（固定）
-- LEDA 目录: `/Users/caoxicz/workspace-mac/leda/LedaTriage/output_<JIRA_ID>/`
+- LEDA 目录: `/home/caoxicz/workspace/leda/LedaTriage/output_<JIRA_ID>/`
 
 如果用户漏了参数，追问补全。
 
@@ -53,12 +193,33 @@ v0.1 范围：解析 LEDA 信号 → subsystem_map 粗筛 → package 名 + keyw
 
 ### Step 1: 解析 LEDA JSON 提取信号
 
+#### 1.0 【最先做】提取 LEDA 的权威结论（见铁律 1）
+
+在提取零散信号之前，**先**把 LEDA 的最终判定读出来并采纳。读取顺序：
+1. `~/workspace/leda/LedaTriage/output_<JIRA_ID>/summaries/<JIRA_ID>_*.md`、`crash_report.md`、`*_analysis.md`；
+2. 若目录里没有明确结论，用 `dsai-mcp jira_get_issue` 拉 JIRA 上 LEDA/triage bot 的 comment。
+
+从中逐字提取并记录（后续 Step 3 直接把它当嫌疑 #1，可信度：高）：
+
+```
+leda_verdict = {
+    root_cause_cr: "",        # 如 CR-303318583，含 confidence（STRONG/…）
+    suspect_package: "",      # 如 VegaHLOOBELib
+    crash_attribution: "",    # 进程/线程/module，如 HLOOBE Toolkit!Render SIGABRT
+    ruled_out: [],            # LEDA 已排除的方向，如 [Weston/platform-graphics, Connectivity]
+    forward_fix_cr: "",       # 如 CR-305486772 / MMSETUP-31253
+}
+```
+
+- 若 `root_cause_cr` 或 `suspect_package` 有值 → **直接进入铁律 2**：checkout 该 package，定位 commit SHA，跳过 subsystem_map 粗筛。
+- 若两者都为空 → 才走下面的 1.2 起的信号提取 + subsystem 打分兜底，并在报告标注"LEDA 未给出明确 root-cause"。
+
 #### 1.1 定位文件
 
 读取 LEDA 输出目录中的核心 JSON 文件：
 
 ```
-/Users/caoxicz/workspace-mac/leda/LedaTriage/output_<JIRA_ID>/work/issue_triage_<JIRA_ID>.json
+/home/caoxicz/workspace/leda/LedaTriage/output_<JIRA_ID>/work/issue_triage_<JIRA_ID>.json
 ```
 
 > 注意：文件名中 JIRA_ID 的格式可能是 `BOC-2377` 或 `BOC2377`（无连字符），两种都尝试。
@@ -301,7 +462,7 @@ v0.1 输出后自动继续执行 Step 5（v0.2 commit 级别分析）。
 ## 测试数据
 
 **用 BOC-2377 测试：**
-- LEDA 目录: `/Users/caoxicz/workspace-mac/leda/LedaTriage/output_BOC-2377`
+- LEDA 目录: `/home/caoxicz/workspace/leda/LedaTriage/output_BOC-2377`
 - Good event ID: `6438976910`
 - Bad event ID: `6492635926`
 
@@ -333,7 +494,7 @@ v0.1 输出完成后自动继续。或者用户明确请求：
 
 ### 5.2 获取 Commit Detail
 
-对每个 HIGH tier package（限制最多处理 **Top 15** 个最相关的），用 `ReadInternalWebsites` 读取：
+对**铁律 4 选出的深度分析集**（关联度 Top 5 ∪ LEDA 点名包 ∪ crash 栈命中包，去重后通常 ≤ 7 个）里的每个 package，用 `ReadInternalWebsites` 读取：
 
 **URL 格式（version diff，显示所有 commit）：**
 ```
@@ -821,6 +982,32 @@ Gerrit/CR: <fix 的 review 链接>
 └─────────────────────────────────────────────────────────┘
 ```
 
+### 9.6 需要精读源码时：用 brazil 下载 package 到本地
+
+在 bisect 分析过程中（尤其 Step 5–9 判断某个 commit 的代码 diff、验证因果链、
+或确认某函数是否真的引入问题时），如果仅凭 `ReadInternalWebsites` 抓取的单文件
+片段不足以判断，需要**完整精读某个 package 的源代码**，可以直接用 brazil 命令把
+该 package 下载到本地固定的 workspace 里：
+
+**目标目录（固定）：** `~/workspace/vml/repo1/repo1/src`
+
+该目录已是一个 brazil workspace 的 `src/`，直接在其中 checkout 目标 package 即可：
+
+```bash
+cd ~/workspace/vml/repo1/repo1
+brazil ws use -p <PACKAGE_NAME>
+# 源码即出现在 ~/workspace/vml/repo1/repo1/src/<PACKAGE_NAME>/
+```
+
+**使用约定：**
+- 只在 online 单文件抓取不够、需要跨文件/整包阅读时才下载，避免无谓拉取。
+- 下载后用本地文件读取/搜索工具精读，不要把整包内容灌进分析上下文；只提炼与嫌疑
+  commit 相关的证据。
+- 如需查看历史版本的代码，checkout 后可在该 package 目录内用 git 切到对应 commit
+  （bisect 中 good/bad 版本对应的 SRCREV）。
+- 这是**辅助验证手段**，不改变 Step 6/11 的打分与排序逻辑；读到的源码证据应回填到
+  对应嫌疑的「因果链」与「验证方法」中。
+
 ---
 
 ## Step 10 (v0.3): 最终输出报告（严格格式）
@@ -856,37 +1043,39 @@ Gerrit/CR: <fix 的 review 链接>
 🔀 改动类型: SRCREV bump / 驱动变更 / 服务配置 / 应用逻辑
 👤 Author: <author> (<alias>)
 📅 Date: <commit date>
+🎯 Commit SHA: <短/全 SHA，如 ddd7842>  ← 铁律 2 必填，禁止留空或只写 CR 号
+   在 HEAD: <是/否>（git merge-base --is-ancestor <sha> HEAD）
+   对应 CR: <commit message 里的 cr: CR-xxxxxxx，与 LEDA 结论交叉核对>
 🔗 Link: <code.amazon.com commit URL or Gerrit6 URL>
 
 📝 改动内容:
-   <具体描述改了什么，old → new，如有 SRCREV 写出 old hash → new hash>
+   <具体描述改了什么，old → new，如有 SRCREV 写出 old hash → new hash；
+    引用该 commit diff 里的关键代码行，证明它对应 LEDA 描述的机制>
 
 🧠 推理过程:
-   <为什么怀疑这个改动？keyword 匹配了什么？subsystem 关联是什么？
-    如果有历史先验加分，说明来源>
+   <首选：LEDA 结论直接指认了这个 CR/package（原样引用 LEDA 原文）；
+    仅当 LEDA 未指认时，才写 keyword/subsystem 打分依据>
 
 🔗 因果链:
    <改动> → <中间步骤1> → <中间步骤2> → ... → <观察到的症状>
 
-🔬 验证方法:
-   Package: <需要操作的 package>
-   操作: <revert SRCREV / revert commit / 修改配置 / cherry-pick fix>
-   具体步骤:
-   1. <step 1>
-   2. <step 2>
-   3. <step 3>
+🔬 验证方法（必须给出可直接执行的 revert 命令）:
+   ```bash
+   cd ~/workspace/vml/repo1/repo1/src/<PACKAGE>
+   git revert <sha>
+   ```
    预期结果: <如果此改动是 root cause，验证后应看到什么>
    注意事项: <可能的副作用>
 
 🔧 已知 Fix（如有）:
-   - <fix 描述>: <Gerrit/CR link>
-   - 状态: <已 merge / pending review / 未提交>
+   - <forward fix CR 描述>: <Gerrit/CR link>
+   - 状态: <已 merge / pending review / 未 merge——若未 merge，注明"直接 revert culprit commit 是最干净的止血办法">
 
 ───────────────────────────────────────────────────────────────────
 🟡 嫌疑 #2 [Score: <XX>] [可信度: 高/中/低]
 ───────────────────────────────────────────────────────────────────
 
-（同上格式，每个字段都必须填写）
+（同上格式，每个字段都必须填写，Commit SHA 与 revert 命令一样必填）
 
 ───────────────────────────────────────────────────────────────────
 🟢 嫌疑 #3 [Score: <XX>] [可信度: 低]
@@ -910,10 +1099,13 @@ Gerrit/CR: <fix 的 review 链接>
 
 ### 10.3 模板填写规则
 
+0. **（铁律 1）LEDA 已指认 root-cause CR/package 时，嫌疑 #1 必须是它**，并在"推理过程"里原样引用 LEDA 结论；禁止用 subsystem/keyword 打分把 LEDA 的结论挤到后面或替换掉。
+0b. **（铁律 2）每个嫌疑必须给出 Commit SHA + 可直接执行的 revert 命令**，并确认该 SHA 在 mainline HEAD 里。只写 package 名或 CR 号而无 commit SHA 视为不合格报告。
+0c. **（铁律 3）必须同时参照 LEDA 结论与 good→bad VS diff，缺一不可**：无论 LEDA 是否点名 culprit 都要拉 Step 2 的 VS diff，把 LEDA 点名的 package/CR 与 diff 窗口交叉核对；每个嫌疑标注证据来源 `[LEDA 点名]` / `[在 diff 窗口内]` / `[两者皆有]`。`在 mainline HEAD 里` 不能替代 `在 good→bad 窗口里`。若 LEDA 点名的 commit 在 diff 窗口找不到，必须如实下调其可信度并说明矛盾。
 1. **每个嫌疑必须有完整的推理过程** — 不能只写"keyword 匹配"，要解释为什么这个匹配有意义
 2. **因果链必须从改动出发到达症状** — 中间步骤不能跳跃，每一步都要有逻辑依据
-3. **验证方法必须具体到可执行** — 不能只说"revert 试试"，要写清楚改哪个文件、改什么值
-4. **已知 Fix 必须附 link** — 如果有 Gerrit/CR 链接就写，没有就写"未找到"
+3. **验证方法必须具体到可执行** — 不能只说"revert 试试"，要写清楚 commit SHA 和 revert 命令
+4. **已知 Fix 必须附 link** — 如果有 Gerrit/CR 链接就写，没有就写"未找到"；forward fix 未 merge 时注明"直接 revert culprit commit 是最干净的止血办法"
 5. **Score ≥ 10 的嫌疑全部输出** — 不能因为 #1 明显就省略 #2、#3
 6. **如果只有 1 个嫌疑（如历史已知 root cause），也必须完整填写所有字段**
 7. **False Positive 提醒** — 如果历史数据中有 false positive 记录，必须输出提醒防止误判
@@ -923,7 +1115,7 @@ Gerrit/CR: <fix 的 review 链接>
 ## 测试数据（v0.2）
 
 **继续用 BOC-2420 测试：**
-- LEDA 目录: `/Users/caoxicz/workspace-mac/leda/LedaTriage/output_BOC-2420`
+- LEDA 目录: `/home/caoxicz/workspace/leda/LedaTriage/output_BOC-2420`
 - Good event ID: `6484997320`
 - Bad event ID: `6486201555`
 
@@ -1133,7 +1325,7 @@ Wants=<service5>
 
 ### 13.2 存储位置和格式
 
-**目录：** `/Users/caoxicz/workspace-mac/leda/regression-bisector/history/`
+**目录：** `/home/caoxicz/workspace/leda/regression-bisector/history`
 
 **文件命名：** `<JIRA_ID>.json`（如 `BOC-2420.json`）
 
@@ -1511,5 +1703,9 @@ VS diff 中 "Removed" 的包如果同时有同名/类似名的 "Added" 或 sourc
 | **v0.1** | 解析 LEDA + subsystem_map 粗筛 + 分 tier 输出 | ✅ 已完成 |
 | **v0.2** | commit detail 获取 + 逐 commit 打分 + 排序输出 | ✅ 已完成 |
 | **v0.3** | 候选改动枚举 + 因果链 + 验证指引 + LLM 语义匹配 + 依赖图 + 积累学习 | ✅ 已完成 |
-| **v0.3.1** | JIRA comment 信号 + binary asset 追踪 + 渲染迁移 pattern + 基础设施/消费者归因 + context 管理 + 版本替换检测 | ✅ 当前版本 |
+| **v0.3.1** | JIRA comment 信号 + binary asset 追踪 + 渲染迁移 pattern + 基础设施/消费者归因 + context 管理 + 版本替换检测 | ✅ 已完成 |
+| **v0.3.2** | 两条最高优先级铁律：LEDA triage 结论为权威（不被 subsystem/keyword 打分推翻）+ 必须落地到可 revert 的 commit SHA | ✅ 已完成 |
+| **v0.3.3** | 铁律 3：LEDA 结论与 good→bad VS diff 必须双管齐下、交叉验证；`在 HEAD 里` ≠ `在窗口里`；按嫌疑度输出并标注证据来源（BOC-2517 教训） | ✅ 已完成 |
+| **v0.3.4** | 铁律 4（全量分 tier 强制 + 关联度 Top 5 深度分析，LEDA 点名/栈命中强制并入）+ 铁律 5（crash 栈组件逐一在 diff 反查、命中/未命中都标注）+ 报告覆盖率自检（BOC-2517 第二次复盘：漏筛 Rive/FastImage 教训） | ✅ 已完成 |
+| **v0.3.5** | 铁律 1 红线：LEDA 的"排除 / enabler"标注只降可信度、绝不缩小深度分析集；crash 栈命中包（含最内层基础设施库 Mesa/Panfrost/Skia）强制深挖，Step 17 infra-vs-consumer 降为待验证假设（BOC-2517 第三次复盘：真 culprit CR-301739468 / VegaMetaAmazonGraphics AFBC/mesa-26.1 教训） | ✅ 当前版本 |
 | v0.4 | 自动触发 build 验证 + KBITS 集成 + 更多平台支持 | 待规划 |
